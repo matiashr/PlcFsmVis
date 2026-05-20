@@ -10,7 +10,7 @@ Free for any purpose you wish.
 mkdir build; cd build; cmake ..; make
 
 # run instructions
-$ ./tcpou2st test.TcPOU  test.st
-$ ./stvis test.st  >graph.dot
-$ dot -Tpng graph.dot >graph.png
+$ ./tcpou2st test.TcPOU  test.st  <br /> 
+$ ./stvis test.st  >graph.dot   <br /> 
+$ dot -Tpng graph.dot >graph.png  <br /> 
 
