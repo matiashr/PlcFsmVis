@@ -25,6 +25,7 @@
 #include <vector>
 #include <set>
 #include <map>
+#include <unordered_map>
 #include <algorithm>
 #include <cctype>
 
@@ -43,70 +44,79 @@ struct Transition {
 
 class STParser {
 public:
-    std::vector<std::string>   state_order;
-    std::set<std::string>      states_with_guard;
-    std::vector<Transition>    transitions;
-    std::vector<size_t>        case_lines;   // source line of each committed CASE
+    struct ParsedCase {
+        std::vector<std::string> states;
+        std::set<std::string> guards;
+        std::vector<Transition> transitions;
+        size_t line = 0;
+    };
 
-    explicit STParser(const std::string& src) : src_(src), pos_(0) {}
+    std::vector<ParsedCase> parsed_cases;
+
+    explicit STParser(const std::string& src) : src_(src), pos_(0) {
+        index_method_state_assignments();
+    }
 
     void parse() { parse_file(); }
 
     void emit_dot(std::ostream& out, const std::string& filename = "") const {
-        if (state_order.empty() || transitions.empty()) return;
+        for (size_t idx = 0; idx < parsed_cases.size(); idx++) {
+            const auto& pc = parsed_cases[idx];
+            if (pc.states.empty() || pc.transitions.empty()) continue;
 
-        out << "digraph finite_state_machine {\n";
-        out << "\tfontname=\"Helvetica,Arial,sans-serif\"\n";
-        out << "\tnode [fontname=\"Helvetica,Arial,sans-serif\"]\n";
-        out << "\tedge [fontname=\"Helvetica,Arial,sans-serif\"]\n";
-        out << "\trankdir=LR;\n";
+            out << "digraph finite_state_machine_" << (idx + 1) << " {\n";
+            out << "\tfontname=\"Helvetica,Arial,sans-serif\"\n";
+            out << "\tnode [fontname=\"Helvetica,Arial,sans-serif\"]\n";
+            out << "\tedge [fontname=\"Helvetica,Arial,sans-serif\"]\n";
+            out << "\trankdir=LR;\n";
 
-        if (!filename.empty() && !case_lines.empty()) {
-            out << "\tlabel=\"";
-            for (size_t i = 0; i < case_lines.size(); i++) {
-                if (i > 0) out << "\\n";
-                out << filename << ":" << case_lines[i];
+            if (!filename.empty() && pc.line != 0) {
+                out << "\tlabel=\"" << filename << ":" << pc.line << "\";\n";
+                out << "\tlabelloc=t;\n";
             }
-            out << "\";\n";
-            out << "\tlabelloc=t;\n";
-        }
 
-        out << "\tnode [shape = doublecircle]; " << state_order[0] << " ;\n";
+            out << "\tnode [shape = doublecircle]; " << pc.states[0] << " ;\n";
 
-        if (state_order.size() > 1) {
-            out << "\tnode [shape = circle]";
-            for (size_t i = 1; i < state_order.size(); i++)
-                out << " " << state_order[i];
-            out << ";\n";
-        }
-
-        for (const auto& state : state_order) {
-            if (states_with_guard.count(state))
-                out << "\t" << state << "->" << state << ";\n";
-
-            for (const auto& t : transitions) {
-                if (t.from != state) continue;
-                out << "\t" << t.from << "->" << t.to;
-                if (!t.cond.empty()) {
-                    bool needs_quote = false;
-                    for (char c : t.cond)
-                        if (!isalnum((unsigned char)c) && c != '_') { needs_quote = true; break; }
-                    out << "[label=";
-                    if (needs_quote) out << "\"";
-                    out << t.cond;
-                    if (needs_quote) out << "\"";
-                    out << "]";
-                }
+            if (pc.states.size() > 1) {
+                out << "\tnode [shape = circle]";
+                for (size_t i = 1; i < pc.states.size(); i++) out << " " << pc.states[i];
                 out << ";\n";
             }
-        }
 
-        out << " \n}\n";
+            for (const auto& state : pc.states) {
+                if (pc.guards.count(state)) out << "\t" << state << "->" << state << ";\n";
+
+                for (const auto& t : pc.transitions) {
+                    if (t.from != state) continue;
+                    out << "\t" << t.from << "->" << t.to;
+                    if (!t.cond.empty()) {
+                        bool needs_quote = false;
+                        for (char c : t.cond)
+                            if (!isalnum((unsigned char)c) && c != '_') { needs_quote = true; break; }
+                        out << "[label=";
+                        if (needs_quote) out << "\"";
+                        out << t.cond;
+                        if (needs_quote) out << "\"";
+                        out << "]";
+                    }
+                    out << ";\n";
+                }
+            }
+
+            out << " \n}\n";
+            if (idx + 1 < parsed_cases.size()) out << "\n";
+        }
     }
 
 private:
+    struct StateAssignTarget {
+        std::string lhs;
+        std::string rhs;
+    };
+
     std::string src_;
     size_t      pos_;
+    std::unordered_map<std::string, std::vector<StateAssignTarget>> method_state_assigns_;
 
     // Per-CASE temporaries; merged into the public members only when transitions found
     std::vector<std::string> cur_state_vars_;   // identifiers from CASE expr containing "state"
@@ -114,6 +124,26 @@ private:
     std::set<std::string>    cur_guards_;
     std::vector<Transition>  cur_trans_;
     size_t                   cur_line_ = 0;
+
+    struct CaseContext {
+        std::vector<std::string> state_vars;
+        std::vector<std::string> states;
+        std::set<std::string> guards;
+        std::vector<Transition> transitions;
+        size_t line = 0;
+    };
+
+    CaseContext save_case_context() const {
+        return {cur_state_vars_, cur_states_, cur_guards_, cur_trans_, cur_line_};
+    }
+
+    void restore_case_context(CaseContext&& ctx) {
+        cur_state_vars_ = std::move(ctx.state_vars);
+        cur_states_ = std::move(ctx.states);
+        cur_guards_ = std::move(ctx.guards);
+        cur_trans_ = std::move(ctx.transitions);
+        cur_line_ = ctx.line;
+    }
 
     size_t line_of(size_t pos) const {
         size_t line = 1;
@@ -257,20 +287,133 @@ private:
         return true;
     }
 
-    // Extract identifier tokens from expr that contain "state" (case-insensitive).
-    // These are the variables we expect to see on the LHS of state assignments.
-    static std::vector<std::string> extract_state_vars(const std::string& expr) {
+    static std::string to_lower(std::string s) {
+        std::transform(s.begin(), s.end(), s.begin(),
+                       [](unsigned char c) { return std::tolower(c); });
+        return s;
+    }
+
+    static bool ci_starts_with_at(const std::string& s, size_t pos, const std::string& kw) {
+        if (pos + kw.size() > s.size()) return false;
+        for (size_t i = 0; i < kw.size(); i++) {
+            if (std::tolower((unsigned char)s[pos + i]) != std::tolower((unsigned char)kw[i])) return false;
+        }
+        return true;
+    }
+
+    void index_method_state_assignments() {
+        size_t p = 0;
+        while (p < src_.size()) {
+            if (!ci_starts_with_at(src_, p, "METHOD")) { p++; continue; }
+            if (p > 0 && is_word(src_[p - 1])) { p++; continue; }
+
+            size_t q = p + 6;
+            while (q < src_.size() && isspace((unsigned char)src_[q])) q++;
+            if (q >= src_.size() || (!isalpha((unsigned char)src_[q]) && src_[q] != '_')) { p++; continue; }
+
+            size_t name_start = q;
+            while (q < src_.size() && is_word(src_[q])) q++;
+            std::string method_name = to_lower(src_.substr(name_start, q - name_start));
+
+            size_t body_start = q;
+            size_t end_pos = std::string::npos;
+            size_t search_from = body_start;
+            while (search_from < src_.size()) {
+                size_t e = src_.find("END_METHOD", search_from);
+                if (e == std::string::npos) break;
+                bool ok_before = (e == 0 || !is_word(src_[e - 1]));
+                bool ok_after = (e + 10 >= src_.size() || !is_word(src_[e + 10]));
+                if (ok_before && ok_after) { end_pos = e; break; }
+                search_from = e + 1;
+            }
+            if (end_pos == std::string::npos) break;
+
+            std::string body = src_.substr(body_start, end_pos - body_start);
+            size_t bp = 0;
+            while (bp < body.size()) {
+                while (bp < body.size() && !(isalpha((unsigned char)body[bp]) || body[bp] == '_')) bp++;
+                if (bp >= body.size()) break;
+
+                std::string lhs;
+                if (!parse_lhs_var(body, bp, lhs)) continue;
+
+                while (bp < body.size() && isspace((unsigned char)body[bp])) bp++;
+                if (bp + 1 >= body.size() || body[bp] != ':' || body[bp + 1] != '=') continue;
+                bp += 2;
+
+                while (bp < body.size() && isspace((unsigned char)body[bp])) bp++;
+                if (bp >= body.size() || (!isalpha((unsigned char)body[bp]) && body[bp] != '_')) continue;
+
+                size_t rhs_start = bp;
+                while (bp < body.size() && is_word(body[bp])) bp++;
+                if (bp < body.size() && body[bp] == '.') {
+                    bp++;
+                    while (bp < body.size() && isspace((unsigned char)body[bp])) bp++;
+                    while (bp < body.size() && is_word(body[bp])) bp++;
+                }
+                std::string rhs = trim(body.substr(rhs_start, bp - rhs_start));
+                if (rhs.empty()) continue;
+
+                method_state_assigns_[method_name].push_back({lhs, short_name(rhs)});
+            }
+
+            p = end_pos + 10;
+        }
+    }
+
+    // Extract identifier tokens from CASE expr.
+    // These are the variables we expect to see on the LHS of assignments.
+    static std::vector<std::string> extract_case_vars(const std::string& expr) {
+        size_t p = 0;
+        std::string lhs;
+        if (parse_lhs_var(expr, p, lhs)) return {lhs};
+
         std::vector<std::string> vars;
-        size_t i = 0;
+        size_t i = p;
         while (i < expr.size()) {
             if (isalpha((unsigned char)expr[i]) || expr[i] == '_') {
                 size_t start = i;
                 while (i < expr.size() && (isalnum((unsigned char)expr[i]) || expr[i] == '_')) i++;
                 std::string tok = expr.substr(start, i - start);
-                if (icontains(tok, "state")) vars.push_back(tok);
+                if (std::find(vars.begin(), vars.end(), tok) == vars.end()) vars.push_back(tok);
             } else { i++; }
         }
         return vars;
+    }
+
+    static bool parse_lhs_var(const std::string& s, size_t& p, std::string& out) {
+        while (p < s.size() && isspace((unsigned char)s[p])) p++;
+        if (p >= s.size() || (!isalpha((unsigned char)s[p]) && s[p] != '_')) return false;
+
+        auto parse_ident = [&](std::string& id) {
+            if (p >= s.size() || (!isalpha((unsigned char)s[p]) && s[p] != '_')) return false;
+            size_t start = p;
+            while (p < s.size() && is_word(s[p])) p++;
+            id = s.substr(start, p - start);
+            return true;
+        };
+
+        std::string id;
+        if (!parse_ident(id)) return false;
+        out = id;
+
+        while (true) {
+            while (p < s.size() && isspace((unsigned char)s[p])) p++;
+            if (p < s.size() && s[p] == '^') {
+                p++;
+                while (p < s.size() && isspace((unsigned char)s[p])) p++;
+            }
+            if (p < s.size() && s[p] == '.') {
+                p++;
+                while (p < s.size() && isspace((unsigned char)s[p])) p++;
+                std::string next;
+                if (!parse_ident(next)) return false;
+                out = next;
+                continue;
+            }
+            break;
+        }
+        return true;
     }
 
     void cur_add_state(const std::string& name) {
@@ -286,13 +429,12 @@ private:
 
     // Commit current CASE results into the public collections.
     void commit_case() {
-        for (const auto& s : cur_states_) {
-            if (std::find(state_order.begin(), state_order.end(), s) == state_order.end())
-                state_order.push_back(s);
-        }
-        states_with_guard.insert(cur_guards_.begin(), cur_guards_.end());
-        transitions.insert(transitions.end(), cur_trans_.begin(), cur_trans_.end());
-        case_lines.push_back(cur_line_);
+        ParsedCase pc;
+        pc.states = cur_states_;
+        pc.guards = cur_guards_;
+        pc.transitions = cur_trans_;
+        pc.line = cur_line_;
+        parsed_cases.push_back(std::move(pc));
     }
 
     // Lookahead: next token is a CASE branch label (QualName ':' not followed by '=')
@@ -355,27 +497,35 @@ private:
 
     void parse_file() {
         while (!at_end()) {
-            if (!try_case_stmt()) pos_++;
+            size_t before = pos_;
+            if (!try_case_stmt() && pos_ == before) pos_++;
         }
     }
 
     bool try_case_stmt() {
         size_t saved = pos_;
         if (!try_kw("CASE")) return false;
+
+        CaseContext parent_ctx = save_case_context();
+
         // pos_ is now just past "CASE"; the keyword starts 4 chars before
         cur_line_ = line_of(pos_ - 4);
 
         std::string expr = capture_until_kw("OF");
-        if (!try_kw("OF")) { pos_ = saved; return false; }
-
-        if (!icontains(expr, "state")) {
-            skip_to_matching_end("CASE", "END_CASE");
-            try_char(';');
-            return true;
+        if (!try_kw("OF")) {
+            pos_ = saved;
+            restore_case_context(std::move(parent_ctx));
+            return false;
         }
 
         // Set up per-CASE temporaries
-        cur_state_vars_ = extract_state_vars(expr);
+        cur_state_vars_ = extract_case_vars(expr);
+        if (cur_state_vars_.empty()) {
+            skip_to_matching_end("CASE", "END_CASE");
+            try_char(';');
+            restore_case_context(std::move(parent_ctx));
+            return true;
+        }
         cur_states_.clear();
         cur_guards_.clear();
         cur_trans_.clear();
@@ -387,27 +537,36 @@ private:
 
         try_kw("END_CASE");
         try_char(';');
+        restore_case_context(std::move(parent_ctx));
         return true;
     }
 
     void parse_branches() {
         while (!at_end()) {
+            size_t before = pos_;
             skip_ws_cmts();
             if (peek_kw("END_CASE")) return;
 
             if (peek_kw("ELSE")) {
                 try_kw("ELSE");
-                while (!at_end() && !peek_kw("END_CASE"))
+                while (!at_end() && !peek_kw("END_CASE")) {
+                    size_t before = pos_;
                     skip_stmt_any(false);
+                    if (pos_ == before) pos_++;
+                }
                 return;
             }
 
             std::string label;
-            if (!try_branch_label(label)) { pos_++; continue; }
+            if (!try_branch_label(label)) {
+                if (pos_ == before) pos_++;
+                continue;
+            }
 
             std::string state = short_name(label);
             cur_add_state(state);
             parse_branch_body(state);
+            if (pos_ == before) pos_++;
         }
     }
 
@@ -425,13 +584,17 @@ private:
 
     void parse_branch_body(const std::string& state) {
         while (!at_end()) {
+            size_t before = pos_;
             skip_ws_cmts();
             if (peek_kw("END_CASE") || peek_kw("ELSE")) return;
             if (peek_branch_label()) return;
 
+            if (try_case_stmt()) continue;
             if (try_if_stmt(state)) continue;
             if (try_state_assign(state, false, "")) continue;
+            if (try_method_state_change(state, false, "")) continue;
             skip_stmt_any(true);
+            if (pos_ == before) pos_++;
         }
     }
 
@@ -459,21 +622,28 @@ private:
 
     void parse_if_body(const std::string& state, bool guarded, const std::string& cond) {
         while (!at_end()) {
+            size_t before = pos_;
             skip_ws_cmts();
             if (peek_kw("END_IF") || peek_kw("ELSIF") || peek_kw("ELSE")) return;
             if (peek_kw("END_CASE") || peek_branch_label()) return;
 
+            if (try_case_stmt()) continue;
             if (try_if_stmt(state)) continue;
             if (try_state_assign(state, guarded, cond)) continue;
+            if (try_method_state_change(state, guarded, cond)) continue;
             skip_stmt_any(true);
+            if (pos_ == before) pos_++;
         }
     }
 
     // Match: <ident that exactly matches one of cur_state_vars_> ':=' QualName ';'
     bool try_state_assign(const std::string& current_state, bool guarded, const std::string& cond) {
         size_t saved = pos_;
+        skip_ws_cmts();
+        size_t p = pos_;
         std::string lhs;
-        if (!try_ident(lhs)) return false;
+        if (!parse_lhs_var(src_, p, lhs)) return false;
+        pos_ = p;
 
         bool matches = std::any_of(cur_state_vars_.begin(), cur_state_vars_.end(),
                                    [&](const std::string& sv){ return iequals(sv, lhs); });
@@ -492,6 +662,59 @@ private:
 
         std::string target = short_name(rhs);
         cur_record_transition(current_state, target, cond, guarded);
+        return true;
+    }
+
+    bool try_method_state_change(const std::string& current_state, bool guarded, const std::string& cond) {
+        size_t saved = pos_;
+        std::string first;
+        if (!try_ident(first)) return false;
+
+        skip_ws_cmts();
+        std::string method_name = first;
+        if (!at_end() && peek() == '^') {
+            pos_++;
+            skip_ws_cmts();
+            if (at_end() || peek() != '.') { pos_ = saved; return false; }
+            pos_++;
+            std::string next;
+            if (!try_ident(next)) { pos_ = saved; return false; }
+            method_name = next;
+        } else if (!at_end() && peek() == '.') {
+            pos_++;
+            std::string next;
+            if (!try_ident(next)) { pos_ = saved; return false; }
+            method_name = next;
+        }
+
+        skip_ws_cmts();
+        if (at_end() || peek() != '(') { pos_ = saved; return false; }
+        pos_++;
+
+        int depth = 1;
+        while (!at_end() && depth > 0) {
+            if (peek() == '\'') {
+                pos_++;
+                while (!at_end() && peek() != '\'') pos_++;
+                if (!at_end()) pos_++;
+                continue;
+            }
+            if (peek() == '(') { depth++; pos_++; continue; }
+            if (peek() == ')') { depth--; pos_++; continue; }
+            pos_++;
+        }
+        if (depth != 0) { pos_ = saved; return false; }
+        try_char(';');
+
+        auto it = method_state_assigns_.find(to_lower(method_name));
+        if (it == method_state_assigns_.end()) return true;
+
+        for (const auto& a : it->second) {
+            bool matches = std::any_of(cur_state_vars_.begin(), cur_state_vars_.end(),
+                                       [&](const std::string& sv) { return iequals(sv, a.lhs); });
+            if (!matches) continue;
+            cur_record_transition(current_state, a.rhs, cond, guarded);
+        }
         return true;
     }
 
@@ -543,8 +766,12 @@ int main(int argc, char* argv[]) {
     STParser parser(src);
     parser.parse();
 
-    if (parser.transitions.empty()) {
-        std::cerr << "No state machines found (CASE <expr with 'state'> OF with assignments to that variable)\n";
+    bool has_graph = false;
+    for (const auto& pc : parser.parsed_cases) {
+        if (!pc.transitions.empty()) { has_graph = true; break; }
+    }
+    if (!has_graph) {
+        std::cerr << "No state machines found (CASE ... OF with assignments to CASE variable)\n";
         return 0;
     }
 
